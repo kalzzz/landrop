@@ -1,0 +1,5 @@
+*.exe
+*.amd64
+*.arm64
+*.darwin*
+test-speed
