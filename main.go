@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -464,13 +465,30 @@ func printPeers() {
 	}
 }
 
-func sendFile(peerID, filePath string) {
+func sendFile(peerIDOrIndex, filePath string) {
 	peersMutex.RLock()
-	peer, exists := peers[peerID]
+	
+	// 尝试解析为数字序号 (1, 2, 3...)
+	if idx, err := strconv.Atoi(peerIDOrIndex); err == nil && idx > 0 {
+		i := 1
+		for _, p := range peers {
+			if i == idx {
+				peersMutex.RUnlock()
+				sendToPeer(p, filePath)
+				return
+			}
+			i++
+		}
+		peersMutex.RUnlock()
+		fmt.Println("❌ 设备序号无效")
+		return
+	}
 	peersMutex.RUnlock()
 
+	// 尝试作为 IP:Port 或直接 peer key
+	peer, exists := peers[peerIDOrIndex]
 	if !exists {
-		parts := strings.Split(peerID, ":")
+		parts := strings.Split(peerIDOrIndex, ":")
 		if len(parts) != 2 {
 			fmt.Println("❌ 设备ID无效")
 			return
@@ -480,6 +498,10 @@ func sendFile(peerID, filePath string) {
 		peer = &Peer{IP: parts[0], Port: port}
 	}
 
+	sendToPeer(peer, filePath)
+}
+
+func sendToPeer(peer *Peer, filePath string) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Printf("❌ 无法打开文件: %v\n", err)
