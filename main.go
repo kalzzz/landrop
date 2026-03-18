@@ -239,9 +239,27 @@ func runTransferServer() {
 	}
 }
 
+// enableKeepAlive 配置 TCP KeepAlive 保活
+func enableKeepAlive(conn *net.TCPConn) error {
+	if err := conn.SetKeepAlive(true); err != nil {
+		return err
+	}
+	if err := conn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		return err
+	}
+	return nil
+}
+
 func handleConnection(conn *net.TCPConn) {
-	defer conn.SetDeadline(time.Now().Add(10 * time.Second))
-	conn.SetDeadline(time.Now().Add(300 * time.Second))
+	defer conn.Close()
+
+	// 握手阶段设置超时（30秒足够接收文件名和大小）
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// 启用 KeepAlive 保活连接
+	if err := enableKeepAlive(conn); err != nil {
+		log.Printf("启用 KeepAlive 失败: %v", err)
+	}
 
 	reader := bufio.NewReader(conn)
 
@@ -261,6 +279,9 @@ func handleConnection(conn *net.TCPConn) {
 	fmt.Printf("\n📥 收到文件: %s (%s)\n", filename, formatSize(filesize))
 	fmt.Print("> 是否接收? [Y/n]: ")
 
+	// 清除Deadline，让用户输入不受时间限制
+	conn.SetDeadline(time.Time{})
+
 	reader2 := bufio.NewReader(os.Stdin)
 	response, _ := reader2.ReadString('\n')
 	response = strings.TrimSpace(strings.ToLower(response))
@@ -272,6 +293,9 @@ func handleConnection(conn *net.TCPConn) {
 	}
 
 	conn.Write([]byte("READY\n"))
+
+	// 握手完成，清除Deadline，使用 KeepAlive 保持连接
+	conn.SetDeadline(time.Time{})
 
 	savePath := filepath.Join(config.SavePath, filename)
 	outFile, err := os.Create(savePath)
@@ -470,15 +494,26 @@ func sendFile(peerID, filePath string) {
 	}
 	defer conn.Close()
 
+	// 启用 KeepAlive 保活
+	if err := enableKeepAlive(conn); err != nil {
+		fmt.Printf("警告: 启用 KeepAlive 失败: %v\n", err)
+	}
+
 	conn.SetWriteBuffer(BufferSize * 64)
 
 	fmt.Printf("📤 正在发送: %s (%s)\n", filename, formatSize(filesize))
+
+	// 握手阶段设置超时
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	writer := bufio.NewWriter(conn)
 	fmt.Fprintf(writer, "%d\n", len(filename))
 	writer.WriteString(filename)
 	fmt.Fprintf(writer, "\n%d\n", filesize)
 	writer.Flush()
+
+	// 清除超时，使用 KeepAlive
+	conn.SetDeadline(time.Time{})
 
 	reader := bufio.NewReader(conn)
 	response, err := reader.ReadString('\n')
