@@ -266,14 +266,28 @@ func handleConnection(conn *net.TCPConn) {
 	var filename string
 	var filesize int64
 
+	// 读取文件名长度
 	var nameLen int
-	fmt.Fscan(reader, &nameLen)
-	if nameLen > 0 {
-		nameBytes := make([]byte, nameLen)
-		reader.Read(nameBytes)
-		filename = string(nameBytes)
+	_, err := fmt.Fscan(reader, &nameLen)
+	if err != nil {
+		log.Printf("读取文件名长度失败: %v", err)
+		return
 	}
 
+	if nameLen > 0 {
+		// 先消费换行符
+		reader.ReadByte()
+		// 消费换行符后的文件名
+		filenameBytes, err := reader.ReadBytes('\n')
+		if err != nil {
+			log.Printf("读取文件名失败: %v", err)
+			return
+		}
+		// 去掉末尾的换行符
+		filename = strings.TrimSuffix(string(filenameBytes), "\n")
+	}
+
+	// 读取文件大小
 	fmt.Fscan(reader, &filesize)
 
 	fmt.Printf("\n📥 收到文件: %s (%s)\n", filename, formatSize(filesize))
@@ -297,6 +311,9 @@ func handleConnection(conn *net.TCPConn) {
 	// 握手完成，清除Deadline，使用 KeepAlive 保持连接
 	conn.SetDeadline(time.Time{})
 
+	if filename == "" {
+		filename = "untitled_file"
+	}
 	savePath := filepath.Join(config.SavePath, filename)
 	outFile, err := os.Create(savePath)
 	if err != nil {
@@ -506,10 +523,12 @@ func sendFile(peerID, filePath string) {
 	// 握手阶段设置超时
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
+	// 发送格式: 长度\n文件名\n大小\n
 	writer := bufio.NewWriter(conn)
 	fmt.Fprintf(writer, "%d\n", len(filename))
 	writer.WriteString(filename)
-	fmt.Fprintf(writer, "\n%d\n", filesize)
+	writer.WriteByte('\n')  // 添加换行符分隔
+	fmt.Fprintf(writer, "%d\n", filesize)
 	writer.Flush()
 
 	// 清除超时，使用 KeepAlive
