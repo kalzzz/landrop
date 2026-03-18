@@ -10,7 +10,9 @@
 - 🔒 无需互联网，纯局域网传输
 - 📱 跨平台 (Windows/Linux/macOS)
 
-## 下载对应版本
+## 下载
+
+**[Release 页面](https://github.com/kalzzz/landrop/releases)** - 下载对应平台的二进制文件
 
 | 平台 | 文件名 |
 |------|--------|
@@ -19,62 +21,115 @@
 | Linux ARM64 | `landrop-linux-arm64` |
 | macOS x64 | `landrop-darwin-amd64` |
 
-## 使用方法
+## 快速开始
 
-### 接收方 (先开启)
+### 1. 接收方 (先开启)
 
 ```bash
 # Windows
 landrop-windows-amd64.exe -server -name "我的电脑"
 
-# Linux
+# Linux / macOS
 ./landrop-linux-amd64 -server -name "我的电脑"
 ```
 
-### 发送方
+### 2. 发送方
 
 ```bash
-# 扫描设备
-./landrop-linux-amd64
-
-# 交互界面:
-#   s        - 扫描设备
-#   send     - 发送文件
-#   q        - 退出
+./landrop -name "发送端"
 ```
+
+### 3. 交互界面
+
+```
+📱 发现以下设备:
+  [1] 我的电脑 (192.168.1.100:45679)
+
+操作:
+  [s]      扫描设备
+  [send]   发送文件
+  [q]      退出
+
+> send 1 test.mp4    # 发送文件给第1个设备
+# 或
+> send 192.168.1.100:45679 test.mp4  # 直接指定 IP:端口
+```
+
+## 使用说明
+
+### 发送文件
+
+方式一：使用数字序号
+```
+> send 1 filename.ext
+```
+
+方式二：使用 IP:端口
+```
+> send 192.168.1.100:45679 filename.ext
+```
+
+### 命令
+
+| 命令 | 说明 |
+|------|------|
+| `s` 或 `scan` | 扫描局域网设备 |
+| `send <序号/IP> <文件>` | 发送文件 |
+| `q` 或 `quit` | 退出 |
+
+### 参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--name` | 设备名称 | 主机名 |
+| `--path` | 保存路径 | `./downloads` |
+| `--server` | 开启接收模式 | 否 |
 
 ## 传输大文件
 
 ```
-📤 进度: 45.2% | 2.5 GB / 5.5 GB | 速度: 112.5 MB/s
-✅ 传输完成! 5.5 GB (平均 98.3 MB/s, 耗时 57.3s)
+📥 收到文件: vacation.mov (2.5 GB)
+> 是否接收? [Y/n]: y
+📥 进度: 45.2% | 1.1 GB / 2.5 GB | 速度: 112.5 MB/s
+✅ 传输完成! 2.5 GB (平均 98.3 MB/s, 耗时 25.7s)
 ```
 
-### 传输速度说明
+### 速度说明
 
-- 局域网速度通常受限于设备网卡 (100MB/s ~ 125MB/s)
+- 局域网速度受限于设备网卡
 - WiFi 5: 约 30-50 MB/s
 - WiFi 6: 约 80-120 MB/s
 - 有线千兆: 约 100+ MB/s
 
-## 参数说明
-
-| 参数 | 说明 |
-|------|------|
-| `--name` | 设备名称 |
-| `--path` | 保存路径 (默认: ./downloads) |
-| `--server` | 开启接收模式 |
-
 ## 协议
 
-| 功能 | 端口 |
-|------|------|
-| 设备发现 | UDP 45678 |
-| 文件传输 | TCP 45679 |
+| 功能 | 端口 | 协议 |
+|------|------|------|
+| 设备发现 | 45678 | UDP |
+| 文件传输 | 45679 | TCP |
 
-## 注意事项
+## 常见问题
 
-1. 发送方和接收方需要在同一局域网
-2. 防火墙需要放行 45678/45679 端口
-3. 接收方需要先开启 `-server` 模式
-4. 使用 WiFi 6 或有线连接可获得最佳速度
+**Q: 收不到设备？**
+A: 确保接收方已开启 `-server` 模式，双方在同一局域网
+
+**Q: 传输中断？**
+A: 已修复大文件传输超时问题，使用 KeepAlive 保活连接
+
+**Q: 文件名乱码？**
+A: 已修复文件名解析，支持空格和特殊字符
+
+## 开发
+
+```bash
+# 编译
+go build -o landrop
+
+# 测试
+go test -v
+
+# 交叉编译
+GOOS=linux GOARCH=amd64 go build -o landrop-linux-amd64
+GOOS=windows GOARCH=amd64 go build -o landrop-windows-amd64.exe
+GOOS=darwin GOARCH=amd64 go build -o landrop-darwin-amd64
+```
