@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -12,596 +14,593 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 const (
-	DiscoveryPort = 45678
-	TransferPort  = 45679
-	BufferSize    = 64 * 1024
+	DiscPort   = 45678
+	XferPort   = 45679
+	BufSz      = 64 * 1024
+	ChunkSz    = 1024 * 1024
+	MaxWorkers = 8
+	ProtoV2    = "PROTOCOL_V2"
 )
 
 type Peer struct {
-	ID       string
-	Name     string
-	IP       string
-	Port     int
-	LastSeen time.Time
+	ID, Name, IP string
+	Port         int
+	LastSeen     time.Time
 }
 
 type Config struct {
-	DeviceName string
-	SavePath   string
-	IsServer   bool
+	DeviceName, SavePath string
+	IsServer, EnableParallel bool
 }
 
 var (
-	config     Config
-	peers      = make(map[string]*Peer)
-	peersMutex sync.RWMutex
-	stopChan   = make(chan bool)
+	cfg      Config
+	peers    = make(map[string]*Peer)
+	peersMut sync.RWMutex
+	stopCh   = make(chan bool)
 )
 
 func init() {
-	hostname, _ := os.Hostname()
-	flag.StringVar(&config.DeviceName, "name", hostname, "Device name")
-	flag.StringVar(&config.SavePath, "path", "./downloads", "Save path for received files")
-	flag.BoolVar(&config.IsServer, "server", false, "Run as receiver mode")
+	h, _ := os.Hostname()
+	flag.StringVar(&cfg.DeviceName, "name", h, "Device name")
+	flag.StringVar(&cfg.SavePath, "path", "./downloads", "Save path")
+	flag.BoolVar(&cfg.IsServer, "server", false, "Run as receiver")
+	flag.BoolVar(&cfg.EnableParallel, "parallel", true, "Enable parallel transfer")
 }
 
 func main() {
 	flag.Parse()
-
-	if err := os.MkdirAll(config.SavePath, 0755); err != nil {
-		log.Printf("Warning: Could not create download directory: %v", err)
-		config.SavePath = os.TempDir()
+	if err := os.MkdirAll(cfg.SavePath, 0755); err != nil {
+		cfg.SavePath = os.TempDir()
 	}
-
 	log.SetFlags(0)
-	log.SetPrefix("[" + config.DeviceName + "] ")
-
+	log.SetPrefix("[" + cfg.DeviceName + "] ")
 	fmt.Printf(`
 ╔═══════════════════════════════════════════╗
 ║          LANDrop - Go 实现               ║
-║     局域网点对点文件传输工具             ║
-║        支持大文件高速传输               ║
+║        局域网点对点文件传输              ║
 ╚═══════════════════════════════════════════╝
-
-设备名称: %s
-保存路径: %s
-
-`, config.DeviceName, config.SavePath)
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+设备: %s  路径: %s
+`, cfg.DeviceName, cfg.SavePath)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigChan
+		<-sigCh
 		fmt.Println("\n👋 再见!")
-		stopChan <- true
+		stopCh <- true
 		os.Exit(0)
 	}()
-
-	go runDiscoveryServer()
-
-	if config.IsServer {
-		runTransferServer()
+	go discServer()
+	if cfg.IsServer {
+		xferServer()
 	} else {
-		runClientMode()
+		clientMode()
 	}
 }
 
-func runDiscoveryServer() {
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%d", DiscoveryPort))
+func discServer() {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: DiscPort})
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	conn, err := net.ListenUDP("udp4", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
-
-	log.Printf("🌐 服务发现已启动 (端口 %d)", DiscoveryPort)
-
-	broadcastTicker := time.NewTicker(5 * time.Second)
-	defer broadcastTicker.Stop()
-
-	broadcastPresence(conn)
-
+	defer c.Close()
+	log.Printf("🌐 发现服务 (端口 %d)", DiscPort)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	broadcastPresence(c)
 	buf := make([]byte, 1024)
 	for {
 		select {
-		case <-stopChan:
+		case <-stopCh:
 			return
-		case <-broadcastTicker.C:
-			broadcastPresence(conn)
+		case <-ticker.C:
+			broadcastPresence(c)
 		default:
 		}
-
-		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				cleanupPeers()
-				continue
+		c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if n, addr, err := c.ReadFromUDP(buf); err == nil {
+			handleDiscMsg(c, addr, buf[:n])
+		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			peersMut.Lock()
+			now := time.Now()
+			for id, p := range peers {
+				if now.Sub(p.LastSeen) > 15*time.Second {
+					delete(peers, id)
+				}
 			}
-			continue
+			peersMut.Unlock()
 		}
-
-		handleDiscoveryMessage(conn, remoteAddr, buf[:n])
 	}
 }
 
-func broadcastPresence(conn *net.UDPConn) {
+func broadcastPresence(c *net.UDPConn) {
 	ip := getOutboundIP()
-	msg := fmt.Sprintf("LANDROP_RESPONSE|%s|%s|%d", config.DeviceName, ip, TransferPort)
-
-	broadcastAddrs := []string{"255.255.255.255:45678"}
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		broadcastAddrs = append(broadcastAddrs, fmt.Sprintf("%s.%s.%s.255:45678", parts[0], parts[1], parts[2]))
+	msg := fmt.Sprintf("LANDROP_RESPONSE|%s|%s|%d", cfg.DeviceName, ip, XferPort)
+	addrs := []string{"255.255.255.255:45678"}
+	if p := strings.Split(ip, "."); len(p) == 4 {
+		addrs = append(addrs, fmt.Sprintf("%s.%s.%s.255:45678", p[0], p[1], p[2]))
 	}
-
-	for _, addrStr := range broadcastAddrs {
-		if udpAddr, err := net.ResolveUDPAddr("udp4", addrStr); err == nil {
-			conn.WriteToUDP([]byte(msg), udpAddr)
+	for _, a := range addrs {
+		if udpAddr, err := net.ResolveUDPAddr("udp4", a); err == nil {
+			c.WriteToUDP([]byte(msg), udpAddr)
 		}
 	}
 }
 
-func handleDiscoveryMessage(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
+func handleDiscMsg(c *net.UDPConn, addr *net.UDPAddr, data []byte) {
 	parts := strings.Split(string(data), "|")
 	if len(parts) < 2 {
 		return
 	}
-
-	switch parts[0] {
-	case "LANDROP_DISCOVER":
-		if config.IsServer {
-			ip := getOutboundIP()
-			msg := fmt.Sprintf("LANDROP_RESPONSE|%s|%s|%d", config.DeviceName, ip, TransferPort)
-			conn.WriteToUDP([]byte(msg), addr)
-		}
-
-	case "LANDROP_RESPONSE":
-		if len(parts) >= 4 {
-			peerName := parts[1]
-			peerIP := parts[2]
-			peerPort := 0
-			fmt.Sscanf(parts[3], "%d", &peerPort)
-
-			if peerIP == getOutboundIP() {
-				return
-			}
-
-			peerID := fmt.Sprintf("%s:%d", peerIP, peerPort)
-			peersMutex.Lock()
-			peers[peerID] = &Peer{
-				ID:       peerID,
-				Name:     peerName,
-				IP:       peerIP,
-				Port:     peerPort,
-				LastSeen: time.Now(),
-			}
-			peersMutex.Unlock()
-		}
+	if parts[0] == "LANDROP_DISCOVER" && cfg.IsServer {
+		c.WriteToUDP([]byte(fmt.Sprintf("LANDROP_RESPONSE|%s|%s|%d", cfg.DeviceName, getOutboundIP(), XferPort)), addr)
+	} else if parts[0] == "LANDROP_RESPONSE" && len(parts) >= 4 && parts[2] != getOutboundIP() {
+		var port int
+		fmt.Sscanf(parts[3], "%d", &port)
+		id := fmt.Sprintf("%s:%d", parts[2], port)
+		peersMut.Lock()
+		peers[id] = &Peer{ID: id, Name: parts[1], IP: parts[2], Port: port, LastSeen: time.Now()}
+		peersMut.Unlock()
 	}
 }
 
-func cleanupPeers() {
-	peersMutex.Lock()
-	defer peersMutex.Unlock()
-
-	timeout := 15 * time.Second
-	now := time.Now()
-	for id, peer := range peers {
-		if now.Sub(peer.LastSeen) > timeout {
-			delete(peers, id)
-		}
-	}
-}
-
-func runTransferServer() {
-	addr, err := net.ResolveTCPAddr("tcp4", fmt.Sprintf(":%d", TransferPort))
+func xferServer() {
+	l, err := net.ListenTCP("tcp4", &net.TCPAddr{Port: XferPort})
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	listener, err := net.ListenTCP("tcp4", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer listener.Close()
-
-	log.Printf("📁 文件传输服务已启动 (端口 %d)", TransferPort)
-	log.Printf("💡 等待接收文件... (按 Ctrl+C 退出)")
-	fmt.Println()
-
+	defer l.Close()
+	log.Printf("📁 传输服务 (端口 %d)", XferPort)
+	log.Printf("💡 等待文件...")
 	for {
 		select {
-		case <-stopChan:
+		case <-stopCh:
 			return
 		default:
 		}
-
-		listener.SetDeadline(time.Now().Add(1 * time.Second))
-		conn, err := listener.AcceptTCP()
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			log.Printf("Accept error: %v", err)
-			continue
+		l.SetDeadline(time.Now().Add(1 * time.Second))
+		if conn, err := l.AcceptTCP(); err == nil {
+			go handleConn(conn)
 		}
-
-		go handleConnection(conn)
 	}
 }
 
-// enableKeepAlive 配置 TCP KeepAlive 保活
-func enableKeepAlive(conn *net.TCPConn) error {
-	if err := conn.SetKeepAlive(true); err != nil {
-		return err
-	}
-	if err := conn.SetKeepAlivePeriod(30 * time.Second); err != nil {
-		return err
-	}
-	return nil
-}
-
-func handleConnection(conn *net.TCPConn) {
+func handleConn(conn *net.TCPConn) {
 	defer conn.Close()
-
-	// 握手阶段设置超时（30秒足够接收文件名和大小）
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// 启用 KeepAlive 保活连接
-	if err := enableKeepAlive(conn); err != nil {
-		log.Printf("启用 KeepAlive 失败: %v", err)
+	conn.SetKeepAlive(true)
+	conn.SetKeepAlivePeriod(30 * time.Second)
+	r := bufio.NewReader(conn)
+	vLine, _ := r.ReadString('\n')
+	v2 := strings.TrimSpace(vLine) == ProtoV2
+	var fname string
+	var fsize int64
+	var totalBlocks int
+	var fcs string
+	if v2 {
+		var nameLen int
+		fmt.Fscan(r, &nameLen)
+		r.ReadByte()
+		fb, _ := r.ReadBytes('\n')
+		fname = strings.TrimSuffix(string(fb), "\n")
+		fmt.Fscan(r, &fsize)
+		fmt.Fscan(r, &totalBlocks)
+		fmt.Fscan(r, &fcs)
+		r.ReadByte()
+		fmt.Printf("\n📥 收到: %s (%s) [V2, %d blocks]\n", fname, fs(fsize), totalBlocks)
+	} else {
+		var nameLen int
+		fmt.Sscan(vLine, &nameLen)
+		r.ReadByte()
+		fb, _ := r.ReadBytes('\n')
+		fname = strings.TrimSuffix(string(fb), "\n")
+		fmt.Fscan(r, &fsize)
+		fmt.Printf("\n📥 收到: %s (%s)\n", fname, fs(fsize))
 	}
-
-	reader := bufio.NewReader(conn)
-
-	var filename string
-	var filesize int64
-
-	// 读取文件名长度
-	var nameLen int
-	_, err := fmt.Fscan(reader, &nameLen)
-	if err != nil {
-		log.Printf("读取文件名长度失败: %v", err)
-		return
-	}
-
-	if nameLen > 0 {
-		// 先消费换行符
-		reader.ReadByte()
-		// 消费换行符后的文件名
-		filenameBytes, err := reader.ReadBytes('\n')
-		if err != nil {
-			log.Printf("读取文件名失败: %v", err)
-			return
-		}
-		// 去掉末尾的换行符
-		filename = strings.TrimSuffix(string(filenameBytes), "\n")
-	}
-
-	// 读取文件大小
-	fmt.Fscan(reader, &filesize)
-
-	fmt.Printf("\n📥 收到文件: %s (%s)\n", filename, formatSize(filesize))
 	fmt.Print("> 是否接收? [Y/n]: ")
-
-	// 清除Deadline，让用户输入不受时间限制
 	conn.SetDeadline(time.Time{})
-
-	reader2 := bufio.NewReader(os.Stdin)
-	response, _ := reader2.ReadString('\n')
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	if response != "" && response != "y" && response != "yes" {
+	if resp, _ := bufio.NewReader(os.Stdin).ReadString('\n'); strings.TrimSpace(strings.ToLower(resp)) != "" && strings.TrimSpace(strings.ToLower(resp)) != "y" {
 		conn.Write([]byte("DENIED\n"))
 		fmt.Println("❌ 已拒绝")
 		return
 	}
-
 	conn.Write([]byte("READY\n"))
-
-	// 握手完成，清除Deadline，使用 KeepAlive 保持连接
-	conn.SetDeadline(time.Time{})
-
-	if filename == "" {
-		filename = "untitled_file"
+	conn.SetReadBuffer(BufSz * 64)
+	if v2 {
+		recvV2(conn, fname, fsize, totalBlocks)
+	} else {
+		recvV1(conn, fname, fsize)
 	}
-	savePath := filepath.Join(config.SavePath, filename)
-	outFile, err := os.Create(savePath)
+}
+
+func recvV1(conn *net.TCPConn, fname string, fsize int64) {
+	if fname == "" {
+		fname = "untitled"
+	}
+	f, err := os.Create(filepath.Join(cfg.SavePath, fname))
 	if err != nil {
-		log.Printf("创建文件失败: %v", err)
 		return
 	}
-	defer outFile.Close()
-
-	conn.SetReadBuffer(BufferSize * 64)
-
-	buf := make([]byte, BufferSize)
-	var received int64
-	var lastPrint time.Time
-	startTime := time.Now()
-
-	for received < filesize {
-		n, err := reader.Read(buf)
+	defer f.Close()
+	buf := make([]byte, BufSz)
+	var recvd int64
+	start := time.Now()
+	last := start
+	for recvd < fsize {
+		n, _ := conn.Read(buf)
 		if n == 0 {
 			break
 		}
-		if err != nil && err.Error() != "EOF" {
-			log.Printf("读取错误: %v", err)
-			break
-		}
-
-		if _, werr := outFile.Write(buf[:n]); werr != nil {
-			log.Printf("写入错误: %v", werr)
-			break
-		}
-		received += int64(n)
-
-		if time.Since(lastPrint) > 500*time.Millisecond {
-			elapsed := time.Since(startTime).Seconds()
-			speed := float64(received) / elapsed / 1024 / 1024
-			percent := float64(received) * 100 / float64(filesize)
-			fmt.Printf("\r📥 进度: %.1f%% | %s / %s | 速度: %.1f MB/s", 
-				percent, formatSize(received), formatSize(filesize), speed)
-			lastPrint = time.Now()
+		f.Write(buf[:n])
+		recvd += int64(n)
+		if time.Since(last) > 500*time.Millisecond {
+			elapsed := time.Since(start).Seconds()
+			fmt.Printf("\r📥 %.1f%% | %s / %s | %.1f MB/s", float64(recvd)*100/float64(fsize), fs(recvd), fs(fsize), float64(recvd)/elapsed/1024/1024)
+			last = time.Now()
 		}
 	}
-
-	elapsed := time.Since(startTime).Seconds()
-	avgSpeed := float64(received) / 1024 / 1024 / elapsed
-	fmt.Printf("\n✅ 传输完成! %s (平均 %.1f MB/s, 耗时 %.1fs)\n", 
-		formatSize(received), avgSpeed, elapsed)
+	fmt.Printf("\n✅ 完成! %s (%.1f MB/s)\n", fs(recvd), float64(recvd)/1024/1024/time.Since(start).Seconds())
 	fmt.Print("> ")
 }
 
-func runClientMode() {
+func recvV2(conn *net.TCPConn, fname string, fsize int64, totalBlocks int) {
+	if fname == "" {
+		fname = "untitled"
+	}
+	path := filepath.Join(cfg.SavePath, fname)
+	df, _ := os.Create(path)
+	if fsize > 0 {
+		df.Truncate(fsize)
+	}
+	df.Close()
+	f, _ := os.OpenFile(path, os.O_RDWR, 0644)
+	if f != nil {
+		defer f.Close()
+	}
+	mp := make(map[int][]byte)
+	done := 0
+	r := bufio.NewReader(conn)
+	start := time.Now()
+	last := start
+	recvd := int64(0)
+	for done < totalBlocks {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if line == "END|" {
+			break
+		}
+		if !strings.HasPrefix(line, "BLOCK|") {
+			continue
+		}
+		p := strings.Split(line, "|")
+		if len(p) < 5 {
+			continue
+		}
+		bi, _ := strconv.Atoi(p[1])
+		bs, _ := strconv.Atoi(p[3])
+		cs := p[4]
+		data := make([]byte, bs)
+		n, err := io.ReadFull(r, data)
+		if err != nil || n != bs {
+			break
+		}
+		recvd += int64(n)
+		h := sha256.New()
+		h.Write(data)
+		if fmt.Sprintf("%x", h.Sum(nil)) != cs {
+			continue
+		}
+		mp[bi] = data
+		for {
+			d, ok := mp[done]
+			if !ok {
+				break
+			}
+			if f != nil {
+				f.WriteAt(d, int64(done)*ChunkSz)
+			}
+			done++
+		}
+		conn.Write([]byte(fmt.Sprintf("ACK|%d|%d\n", bi, n)))
+		if time.Since(last) > 500*time.Millisecond {
+			elapsed := time.Since(start).Seconds()
+			fmt.Printf("\r📥 %.1f%% | %s / %s | %.1f MB/s [块 %d/%d]", float64(recvd)*100/float64(fsize), fs(recvd), fs(fsize), float64(recvd)/elapsed/1024/1024, bi+1, totalBlocks)
+			last = time.Now()
+		}
+	}
+	elapsed := time.Since(start).Seconds()
+	fmt.Printf("\n✅ 完成! %s (%.1f MB/s)\n", fs(fsize), float64(fsize)/1024/1024/elapsed)
+	fmt.Print("> ")
+}
+
+type ci struct {
+	idx    int
+	size   int
+	cksum  string
+	data   []byte
+	acked  bool
+}
+
+func sendV2(conn *net.TCPConn, file *os.File, fname string, fsize int64) {
+	blocks := int((fsize + ChunkSz - 1) / ChunkSz)
+	workers := 1
+	if cfg.EnableParallel {
+		if blocks < 4 {
+			workers = 2
+		} else if blocks < 16 {
+			workers = 4
+		} else {
+			workers = MaxWorkers
+		}
+	}
+	h := sha256.New()
+	file.Seek(0, 0)
+	for buf := make([]byte, BufSz); ; {
+		if n, _ := file.Read(buf); n == 0 {
+			break
+		} else {
+			h.Write(buf[:n])
+		}
+	}
+	fcs := fmt.Sprintf("%x", h.Sum(nil))
+	fmt.Fprintf(bufio.NewWriter(conn), "%s\n%d\n%s\n%d\n%d\n%s\n", ProtoV2, len(fname), fname, fsize, blocks, fcs)
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if resp, _ := bufio.NewReader(conn).ReadString('\n'); strings.Contains(resp, "DENIED") {
+		fmt.Println("❌ 对方拒绝")
+		return
+	}
+	conn.SetDeadline(time.Time{})
+	conn.SetWriteBuffer(BufSz * 64)
+	chunks := make([]ci, blocks)
+	for i := 0; i < blocks; i++ {
+		sz := ChunkSz
+		off := int64(i) * ChunkSz
+		if off+int64(sz) > fsize {
+			sz = int(fsize - off)
+		}
+		chunks[i].idx, chunks[i].size = i, sz
+		file.Seek(off, 0)
+		chunks[i].data = make([]byte, sz)
+		io.ReadFull(file, chunks[i].data)
+		h2 := sha256.New()
+		h2.Write(chunks[i].data)
+		chunks[i].cksum = fmt.Sprintf("%x", h2.Sum(nil))
+	}
+	fmt.Printf("📤 %d workers, %d blocks\n", workers, blocks)
+	var acked int32
+	start := time.Now()
+	go func() {
+		r := bufio.NewReader(conn)
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "ACK|") {
+				if p := strings.Split(line, "|"); len(p) >= 2 {
+					if idx, err := strconv.Atoi(p[1]); err == nil && !chunks[idx].acked {
+						chunks[idx].acked = true
+						atomic.AddInt32(&acked, 1)
+					}
+				}
+			}
+		}
+	}()
+	cq := make(chan int, blocks)
+	for i := 0; i < blocks; i++ {
+		cq <- i
+	}
+	close(cq)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range cq {
+				c := &chunks[idx]
+				conn.Write([]byte(fmt.Sprintf("BLOCK|%d|%d|%d|%s\n", c.idx, blocks, c.size, c.cksum)))
+				conn.Write(c.data)
+			}
+		}()
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for acked < int32(blocks) {
+		<-ticker.C
+		elapsed := time.Since(start).Seconds()
+		if elapsed > 0 {
+			fmt.Printf("\r📤 %.1f%% | %d/%d | %.1f MB/s", float64(acked)*100/float64(blocks), acked, blocks, float64(acked)*float64(ChunkSz)/elapsed/1024/1024)
+		}
+	}
+	ticker.Stop()
+	conn.Write([]byte(fmt.Sprintf("END|%d|%s\n", blocks, fcs)))
+	wg.Wait()
+	fmt.Printf("\n✅ 完成! %s (%.1f MB/s)\n", fs(fsize), float64(fsize)/1024/1024/time.Since(start).Seconds())
+}
+
+func clientMode() {
 	sendDiscoveryProbe()
-	showMenu()
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		listPeers()
+		fmt.Print("> [s]扫描  [send]发送  [q]退出: ")
+		inp, _ := reader.ReadString('\n')
+		inp = strings.TrimSpace(strings.ToLower(inp))
+		switch inp {
+		case "q", "quit", "exit":
+			fmt.Println("👋 再见!")
+			stopCh <- true
+			os.Exit(0)
+		case "s", "scan":
+			sendDiscoveryProbe()
+			time.Sleep(500 * time.Millisecond)
+			listPeers()
+		default:
+			if strings.HasPrefix(inp, "send ") || inp == "send" {
+				parts := strings.Fields(inp)
+				pid, fp := "", ""
+				if len(parts) >= 3 {
+					pid, fp = parts[1], strings.Join(parts[2:], " ")
+				} else {
+					listPeers()
+					fmt.Print("设备ID: ")
+					pid, _ = reader.ReadString('\n')
+					pid = strings.TrimSpace(pid)
+					fmt.Print("文件: ")
+					fp, _ = reader.ReadString('\n')
+					fp = strings.TrimSpace(fp)
+				}
+				if pid != "" && fp != "" {
+					doSend(pid, fp)
+				}
+			}
+		}
+	}
+}
+
+func listPeers() {
+	peersMut.RLock()
+	defer peersMut.RUnlock()
+	fmt.Println("\n📱 设备:")
+	if len(peers) == 0 {
+		fmt.Println("  (无)")
+	} else {
+		i := 1
+		for _, p := range peers {
+			fmt.Printf("  [%d] %s (%s:%d)\n", i, p.Name, p.IP, p.Port)
+			i++
+		}
+	}
 }
 
 func sendDiscoveryProbe() {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
-		IP:   net.IPv4bcast,
-		Port: DiscoveryPort,
-	})
+	c, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4bcast, Port: DiscPort})
 	if err != nil {
-		log.Printf("发送探测失败: %v", err)
 		return
 	}
-	defer conn.Close()
-
+	defer c.Close()
 	ip := getOutboundIP()
 	addrs := []string{"255.255.255.255:45678"}
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		addrs = append(addrs, fmt.Sprintf("%s.%s.%s.255:45678", parts[0], parts[1], parts[2]))
+	if p := strings.Split(ip, "."); len(p) == 4 {
+		addrs = append(addrs, fmt.Sprintf("%s.%s.%s.255:45678", p[0], p[1], p[2]))
 	}
-
-	for _, addrStr := range addrs {
-		if udpAddr, err := net.ResolveUDPAddr("udp4", addrStr); err == nil {
-			conn.WriteToUDP([]byte("LANDROP_DISCOVER"), udpAddr)
+	for _, a := range addrs {
+		if udpAddr, err := net.ResolveUDPAddr("udp4", a); err == nil {
+			c.WriteToUDP([]byte("LANDROP_DISCOVER"), udpAddr)
 		}
 	}
 }
 
-func showMenu() {
-	reader := bufio.NewReader(os.Stdin)
-
-	for {
-		printPeers()
-
-		fmt.Print(`
-操作:
-  [s]      扫描设备
-  [send]   发送文件
-  [q]      退出
-
-> `)
-
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-		input = strings.ToLower(input)
-
-		if input == "q" || input == "quit" || input == "exit" {
-			fmt.Println("👋 再见!")
-			stopChan <- true
-			os.Exit(0)
-		}
-
-		if input == "s" || input == "scan" {
-			sendDiscoveryProbe()
-			time.Sleep(500 * time.Millisecond)
-			printPeers()
-			continue
-		}
-
-		if input == "send" || strings.HasPrefix(input, "send ") {
-			var peerID, filePath string
-			parts := strings.Fields(input)
-			
-			if len(parts) >= 3 {
-				peerID = parts[1]
-				filePath = strings.Join(parts[2:], " ")
-			} else {
-				printPeers()
-				fmt.Print("选择设备ID: ")
-				peerID, _ = reader.ReadString('\n')
-				peerID = strings.TrimSpace(peerID)
-				fmt.Print("文件路径: ")
-				filePath, _ = reader.ReadString('\n')
-				filePath = strings.TrimSpace(filePath)
-			}
-			
-			if peerID != "" && filePath != "" {
-				sendFile(peerID, filePath)
-			}
-			continue
-		}
-	}
-}
-
-func printPeers() {
-	peersMutex.RLock()
-	defer peersMutex.RUnlock()
-
-	fmt.Println("\n📱 发现以下设备:")
-	if len(peers) == 0 {
-		fmt.Println("  (暂无设备，请确保对方已开启接收模式)")
-	} else {
-		i := 1
-		for _, peer := range peers {
-			fmt.Printf("  [%d] %s (%s:%d)\n", i, peer.Name, peer.IP, peer.Port)
-			i++
-		}
-	}
-}
-
-func sendFile(peerIDOrIndex, filePath string) {
-	peersMutex.RLock()
-	
-	// 尝试解析为数字序号 (1, 2, 3...)
-	if idx, err := strconv.Atoi(peerIDOrIndex); err == nil && idx > 0 {
+func doSend(pid, fp string) {
+	peersMut.RLock()
+	var peer *Peer
+	if idx, err := strconv.Atoi(pid); err == nil && idx > 0 {
 		i := 1
 		for _, p := range peers {
 			if i == idx {
-				peersMutex.RUnlock()
-				sendToPeer(p, filePath)
-				return
+				peer = p
+				break
 			}
 			i++
 		}
-		peersMutex.RUnlock()
-		fmt.Println("❌ 设备序号无效")
+	} else if p, ok := peers[pid]; ok {
+		peer = p
+	}
+	peersMut.RUnlock()
+	if peer == nil {
+		if parts := strings.Split(pid, ":"); len(parts) == 2 {
+			var port int
+			fmt.Sscanf(parts[1], "%d", &port)
+			peer = &Peer{IP: parts[0], Port: port}
+		}
+	}
+	if peer == nil {
+		fmt.Println("❌ 设备无效")
 		return
 	}
-	peersMutex.RUnlock()
-
-	// 尝试作为 IP:Port 或直接 peer key
-	peer, exists := peers[peerIDOrIndex]
-	if !exists {
-		parts := strings.Split(peerIDOrIndex, ":")
-		if len(parts) != 2 {
-			fmt.Println("❌ 设备ID无效")
-			return
-		}
-		port := TransferPort
-		fmt.Sscanf(parts[1], "%d", &port)
-		peer = &Peer{IP: parts[0], Port: port}
-	}
-
-	sendToPeer(peer, filePath)
+	sendToPeer(peer, fp)
 }
 
-func sendToPeer(peer *Peer, filePath string) {
-	file, err := os.Open(filePath)
+func sendToPeer(peer *Peer, fp string) {
+	file, err := os.Open(fp)
 	if err != nil {
-		fmt.Printf("❌ 无法打开文件: %v\n", err)
+		fmt.Printf("❌ 无法打开: %v\n", err)
 		return
 	}
 	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		fmt.Printf("❌ 无法获取文件信息: %v\n", err)
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		fmt.Println("❌ 无效文件")
 		return
 	}
-
-	if fileInfo.IsDir() {
-		fmt.Println("❌ 不支持发送目录")
-		return
-	}
-
-	filesize := fileInfo.Size()
-	filename := fileInfo.Name()
-
-	conn, err := net.DialTCP("tcp4", nil, &net.TCPAddr{
-		IP:   net.ParseIP(peer.IP),
-		Port: peer.Port,
-	})
+	fsize, fname := info.Size(), info.Name()
+	conn, err := net.DialTCP("tcp4", nil, &net.TCPAddr{IP: net.ParseIP(peer.IP), Port: peer.Port})
 	if err != nil {
 		fmt.Printf("❌ 连接失败: %v\n", err)
 		return
 	}
 	defer conn.Close()
-
-	// 启用 KeepAlive 保活
-	if err := enableKeepAlive(conn); err != nil {
-		fmt.Printf("警告: 启用 KeepAlive 失败: %v\n", err)
-	}
-
-	conn.SetWriteBuffer(BufferSize * 64)
-
-	fmt.Printf("📤 正在发送: %s (%s)\n", filename, formatSize(filesize))
-
-	// 握手阶段设置超时
+	conn.SetKeepAlive(true)
+	conn.SetKeepAlivePeriod(30 * time.Second)
+	conn.SetWriteBuffer(BufSz * 64)
+	fmt.Printf("📤 发送: %s (%s)\n", fname, fs(fsize))
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// 发送格式: 长度\n文件名\n大小\n
-	writer := bufio.NewWriter(conn)
-	fmt.Fprintf(writer, "%d\n", len(filename))
-	writer.WriteString(filename)
-	writer.WriteByte('\n')  // 添加换行符分隔
-	fmt.Fprintf(writer, "%d\n", filesize)
-	writer.Flush()
-
-	// 清除超时，使用 KeepAlive
+	w := bufio.NewWriter(conn)
+	fmt.Fprintf(w, "%s\n%d\n%s\n%d\n", ProtoV2, len(fname), fname, fsize)
+	w.Flush()
+	resp, _ := bufio.NewReader(conn).ReadString('\n')
+	if strings.Contains(resp, "DENIED") {
+		fmt.Println("❌ 对方拒绝")
+		return
+	}
 	conn.SetDeadline(time.Time{})
-
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Printf("❌ 等待响应失败: %v\n", err)
+	if strings.TrimSpace(resp) == "READY" {
+		fmt.Println("📤 使用 V2 协议")
+		sendV2(conn, file, fname, fsize)
 		return
 	}
+	fmt.Println("📤 使用 V1 协议")
+	sendV1(conn, file, fname, fsize)
+}
 
-	if strings.Contains(response, "DENIED") {
-		fmt.Println("❌ 对方拒绝了文件传输")
+func sendV1(conn *net.TCPConn, file *os.File, fname string, fsize int64) {
+	conn.SetWriteBuffer(BufSz * 64)
+	w := bufio.NewWriter(conn)
+	fmt.Fprintf(w, "%d\n%s\n%d\n", len(fname), fname, fsize)
+	w.Flush()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if resp, _ := bufio.NewReader(conn).ReadString('\n'); strings.Contains(resp, "DENIED") {
+		fmt.Println("❌ 对方拒绝")
 		return
 	}
-
-	startTime := time.Now()
-	sendBuf := make([]byte, BufferSize)
+	conn.SetDeadline(time.Time{})
+	start := time.Now()
+	buf := make([]byte, BufSz)
 	var sent int64
-
 	for {
-		n, err := file.Read(sendBuf)
+		n, err := file.Read(buf)
 		if n == 0 {
 			break
 		}
 		if err != nil && err.Error() != "EOF" {
-			fmt.Printf("❌ 读取错误: %v\n", err)
 			break
 		}
-
-		_, werr := conn.Write(sendBuf[:n])
-		if werr != nil {
-			fmt.Printf("❌ 发送错误: %v\n", werr)
-			break
-		}
+		conn.Write(buf[:n])
 		sent += int64(n)
-
-		elapsed := time.Since(startTime).Seconds()
+		elapsed := time.Since(start).Seconds()
 		if elapsed > 0 {
-			speed := float64(sent) / elapsed / 1024 / 1024
-			percent := float64(sent) * 100 / float64(filesize)
-			fmt.Printf("\r📤 进度: %.1f%% | %s / %s | 速度: %.1f MB/s", 
-				percent, formatSize(sent), formatSize(filesize), speed)
+			fmt.Printf("\r📤 %.1f%% | %s / %s | %.1f MB/s", float64(sent)*100/float64(fsize), fs(sent), fs(fsize), float64(sent)/elapsed/1024/1024)
 		}
 	}
-
-	elapsed := time.Since(startTime).Seconds()
-	avgSpeed := float64(sent) / 1024 / 1024 / elapsed
-	fmt.Printf("\n✅ 发送完成! %s (平均 %.1f MB/s, 耗时 %.1fs)\n", 
-		formatSize(sent), avgSpeed, elapsed)
+	fmt.Printf("\n✅ 完成! %s (%.1f MB/s)\n", fs(sent), float64(sent)/1024/1024/time.Since(start).Seconds())
 }
 
 func getOutboundIP() string {
@@ -610,12 +609,10 @@ func getOutboundIP() string {
 		return "127.0.0.1"
 	}
 	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func formatSize(bytes int64) string {
+func fs(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
