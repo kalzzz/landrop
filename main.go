@@ -275,7 +275,7 @@ func recvV2(conn *net.TCPConn, fname string, fsize int64, totalBlocks int) {
 			break
 		}
 		line = strings.TrimSpace(line)
-		if line == "END|" {
+		if strings.HasPrefix(line, "END|") {
 			break
 		}
 		if !strings.HasPrefix(line, "BLOCK|") {
@@ -299,15 +299,16 @@ func recvV2(conn *net.TCPConn, fname string, fsize int64, totalBlocks int) {
 		if fmt.Sprintf("%x", h.Sum(nil)) != cs {
 			continue
 		}
-		mp[bi] = data
+			mp[bi] = data
 		for {
 			d, ok := mp[done]
 			if !ok {
 				break
 			}
 			if f != nil {
-				f.WriteAt(d, int64(done)*ChunkSz)
+				f.WriteAt(d, int64(bi)*ChunkSz)
 			}
+			delete(mp, done)
 			done++
 		}
 		conn.Write([]byte(fmt.Sprintf("ACK|%d|%d\n", bi, n)))
@@ -352,7 +353,9 @@ func sendV2(conn *net.TCPConn, file *os.File, fname string, fsize int64) {
 		}
 	}
 	fcs := fmt.Sprintf("%x", h.Sum(nil))
-	fmt.Fprintf(bufio.NewWriter(conn), "%s\n%d\n%s\n%d\n%d\n%s\n", ProtoV2, len(fname), fname, fsize, blocks, fcs)
+	w := bufio.NewWriter(conn)
+	fmt.Fprintf(w, "%s\n%d\n%s\n%d\n%d\n%s\n", ProtoV2, len(fname), fname, fsize, blocks, fcs)
+	w.Flush()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	if resp, _ := bufio.NewReader(conn).ReadString('\n'); strings.Contains(resp, "DENIED") {
 		fmt.Println("❌ 对方拒绝")

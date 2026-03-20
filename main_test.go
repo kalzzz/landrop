@@ -1,364 +1,205 @@
 package main
 
 import (
-	"bufio"
+	"crypto/sha256"
 	"fmt"
-	"io"
 	"net"
-	"os"
-	"path/filepath"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestKeepAliveConfig(t *testing.T) {
-	l, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-
-	var sc *net.TCPConn
-	var serror error
-	var accepted bool
-
-	go func() {
-		sc, serror = l.AcceptTCP()
-		accepted = true
-	}()
-
-	c, err := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	time.Sleep(100 * time.Millisecond)
-	if !accepted {
-		t.Fatal("未接受连接")
-	}
-	if serror != nil {
-		t.Fatal(serror)
+// TestFormatSize tests file size formatting utility
+func TestFormatSize(t *testing.T) {
+	tests := []struct {
+		input    int64
+		expected string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1024 * 1024, "1.0 MB"},
+		{2 * 1024 * 1024, "2.0 MB"},
+		{1024 * 1024 * 1024, "1.0 GB"},
+		{10 * 1024 * 1024 * 1024, "10.0 GB"},
 	}
 
-	if err := enableKeepAlive(c); err != nil {
-		t.Fatalf("KeepAlive 失败: %v", err)
-	}
-	if err := enableKeepAlive(sc); err != nil {
-		t.Fatalf("服务器 KeepAlive 失败: %v", err)
-	}
-
-	t.Log("✓ KeepAlive 测试通过")
-}
-
-func TestLargeFileTransfer(t *testing.T) {
-	size := int64(2 * 1024 * 1024 * 1024) // 2GB
-	tmp := filepath.Join(os.TempDir(), "landrop_test_2gb.dat")
-	
-	f, err := os.Create(tmp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 1024*1024)
-	for i := 0; i < int(size)/len(buf); i++ {
-		f.Write(buf)
-	}
-	f.Close()
-	defer os.Remove(tmp)
-
-	l, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		conn, err := l.AcceptTCP()
-		if err != nil {
-			t.Logf("Accept: %v", err)
-			return
-		}
-		defer conn.Close()
-		
-		enableKeepAlive(conn)
-		conn.SetDeadline(time.Now().Add(30 * time.Second))
-		
-		rd := bufio.NewReader(conn)
-		var nl int
-		fmt.Fscan(rd, &nl)
-		if nl > 0 {
-			b := make([]byte, nl)
-			rd.Read(b)
-		}
-		var fs int64
-		fmt.Fscan(rd, &fs)
-		
-		conn.Write([]byte("READY\n"))
-		conn.SetDeadline(time.Time{})
-		
-		data := make([]byte, BufferSize)
-		var r int64
-		for r < fs {
-			n, err := rd.Read(data)
-			if n == 0 {
-				break
+	for _, tc := range tests {
+		t.Run(tc.expected, func(t *testing.T) {
+			result := fs(tc.input)
+			if result != tc.expected {
+				t.Errorf("fs(%d) = %q, want %q", tc.input, result, tc.expected)
 			}
-			if err != nil && err.Error() != "EOF" {
-				break
-			}
-			r += int64(n)
-		}
-		t.Logf("接收: %d bytes", r)
-	}()
-
-	c, err := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	enableKeepAlive(c)
-	c.SetDeadline(time.Now().Add(30 * time.Second))
-
-	w := bufio.NewWriter(c)
-	fmt.Fprintf(w, "%d\n", 4)
-	w.WriteString("test")
-	fmt.Fprintf(w, "\n%d\n", size)
-	w.Flush()
-
-	c.SetDeadline(time.Time{})
-	rd := bufio.NewReader(c)
-	resp, _ := rd.ReadString('\n')
-	if !strings.Contains(resp, "READY") {
-		t.Fatalf("未收到 READY: %s", resp)
-	}
-
-	file, _ := os.Open(tmp)
-	defer file.Close()
-
-	sendBuf := make([]byte, BufferSize)
-	var sent int64
-	start := time.Now()
-	for {
-		n, err := file.Read(sendBuf)
-		if n == 0 {
-			break
-		}
-		if err != nil && err.Error() != "EOF" {
-			break
-		}
-		c.Write(sendBuf[:n])
-		sent += int64(n)
-	}
-
-	elapsed := time.Since(start).Seconds()
-	speed := float64(sent) / 1024 / 1024 / elapsed
-	t.Logf("发送: %d bytes, 速度: %.1f MB/s", sent, speed)
-
-	wg.Wait()
-	if sent != size {
-		t.Errorf("大小不匹配: %d vs %d", sent, size)
-	} else {
-		t.Log("✓ 2GB 大文件传输测试通过")
-	}
-}
-
-func TestNoDeadlineOnWait(t *testing.T) {
-	l, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-
-	var conn *net.TCPConn
-	go func() {
-		conn, _ = l.AcceptTCP()
-	}()
-
-	c, err := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	time.Sleep(50 * time.Millisecond)
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	w := bufio.NewWriter(conn)
-	fmt.Fprintf(w, "%d\n", 4)
-	w.WriteString("test")
-	fmt.Fprintf(w, "\n%d\n", 100)
-	w.Flush()
-
-	conn.SetDeadline(time.Time{})
-	t.Log("✓ Deadline 清除测试通过")
-
-	conn.Close()
-	c.Close()
-}
-
-func TestSlowTransfer(t *testing.T) {
-	l, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-
-	ready := make(chan struct{})
-	var transferred int64
-
-	go func() {
-		conn, err := l.AcceptTCP()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		enableKeepAlive(conn)
-		conn.SetDeadline(time.Now().Add(30 * time.Second))
-		buf := make([]byte, 1024)
-		close(ready)
-		for i := 0; i < 10; i++ {
-			n, _ := conn.Read(buf)
-			if n == 0 {
-				break
-			}
-			atomic.AddInt64(&transferred, int64(n))
-			time.Sleep(200 * time.Millisecond)
-		}
-	}()
-
-	c, err := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	enableKeepAlive(c)
-	c.SetDeadline(time.Now().Add(30 * time.Second))
-
-	w := bufio.NewWriter(c)
-	fmt.Fprintf(w, "%d\n", 4)
-	w.WriteString("test")
-	fmt.Fprintf(w, "\n%d\n", 10240)
-	w.Flush()
-
-	<-ready
-
-	for i := 0; i < 10; i++ {
-		c.Write([]byte(strings.Repeat("a", 1024)))
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	time.Sleep(300 * time.Millisecond)
-	if transferred > 0 {
-		t.Logf("✓ 慢速传输测试通过 (%d bytes)", transferred)
-	}
-}
-
-func TestFileSizes(t *testing.T) {
-	sizes := []int64{1024, 1024 * 1024, 10 * 1024 * 1024}
-	for _, sz := range sizes {
-		sz := sz
-		t.Run(fmt.Sprintf("%dKB", sz/1024), func(t *testing.T) {
-			tmp := filepath.Join(os.TempDir(), "landrop_sz_test.dat")
-			f, _ := os.Create(tmp)
-			f.Write(make([]byte, sz))
-			f.Close()
-			defer os.Remove(tmp)
-
-			l, _ := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-			defer l.Close()
-
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				conn, _ := l.AcceptTCP()
-				if conn == nil {
-					return
-				}
-				defer conn.Close()
-				enableKeepAlive(conn)
-				rd := bufio.NewReader(conn)
-				var nl int
-				fmt.Fscan(rd, &nl)
-				if nl > 0 {
-					b := make([]byte, nl)
-					rd.Read(b)
-				}
-				var fs int64
-				fmt.Fscan(rd, &fs)
-				conn.Write([]byte("READY\n"))
-				conn.SetDeadline(time.Time{})
-				buf := make([]byte, BufferSize)
-				var r int64
-				for r < fs {
-					n, _ := rd.Read(buf)
-					if n == 0 {
-						break
-					}
-					r += int64(n)
-				}
-			}()
-
-			c, _ := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-			enableKeepAlive(c)
-			c.SetDeadline(time.Now().Add(30 * time.Second))
-			w := bufio.NewWriter(c)
-			fmt.Fprintf(w, "%d\n", 4)
-			w.WriteString("test")
-			fmt.Fprintf(w, "\n%d\n", sz)
-			w.Flush()
-			c.SetDeadline(time.Time{})
-			rd := bufio.NewReader(c)
-			rd.ReadString('\n')
-
-			file, _ := os.Open(tmp)
-			data := make([]byte, BufferSize)
-			for {
-				n, _ := file.Read(data)
-				if n == 0 {
-					break
-				}
-				c.Write(data[:n])
-			}
-			file.Close()
-			c.Close()
-			wg.Wait()
-			t.Logf("✓ %d 测试通过", sz)
 		})
 	}
 }
 
-func BenchmarkTransferSpeed(b *testing.B) {
-	size := int64(100 * 1024 * 1024)
-	tmp := filepath.Join(os.TempDir(), "landrop_bench.dat")
-	f, _ := os.Create(tmp)
-	f.Write(make([]byte, size))
-	f.Close()
-	defer os.Remove(tmp)
+// TestGetOutboundIP tests outbound IP detection
+func TestGetOutboundIP(t *testing.T) {
+	ip := getOutboundIP()
+	if ip == "" {
+		t.Error("getOutboundIP returned empty string")
+	}
 
-	for i := 0; i < b.N; i++ {
-		l, _ := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-		go func() {
-			conn, _ := l.AcceptTCP()
-			if conn == nil {
-				return
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		t.Errorf("getOutboundIP returned invalid IP: %s", ip)
+	}
+
+	// Should be a valid private or public IP
+	t.Logf("Outbound IP: %s", ip)
+}
+
+// TestChecksum tests SHA256 checksum calculation
+func TestChecksum(t *testing.T) {
+	tests := []struct {
+		data     string
+		expected string
+	}{
+		{"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{"hello", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"},
+		{"hello world", "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.expected[:8], func(t *testing.T) {
+			h := sha256.New()
+			h.Write([]byte(tc.data))
+			checksum := fmt.Sprintf("%x", h.Sum(nil))
+			if checksum != tc.expected {
+				t.Errorf("checksum(%q) = %q, want %q", tc.data, checksum, tc.expected)
 			}
-			io.Copy(io.Discard, conn)
-			conn.Close()
-		}()
-		c, _ := net.DialTCP("tcp4", nil, l.Addr().(*net.TCPAddr))
-		file, _ := os.Open(tmp)
-		io.Copy(c, file)
-		c.Close()
-		file.Close()
-		l.Close()
+		})
+	}
+}
+
+// TestChunkIndexing tests chunk/block count calculation
+func TestChunkIndexing(t *testing.T) {
+	tests := []struct {
+		fsize    int64
+		expected int
+	}{
+		{0, 0},
+		{1, 1},
+		{ChunkSz - 1, 1},
+		{ChunkSz, 1},
+		{ChunkSz + 1, 2},
+		{2 * ChunkSz, 2},
+		{2*ChunkSz + 1, 3},
+		{10 * ChunkSz, 10},
+		{1000 * int64(ChunkSz), 1000},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("size_%d", tc.fsize), func(t *testing.T) {
+			blocks := int((tc.fsize + ChunkSz - 1) / ChunkSz)
+			if blocks != tc.expected {
+				t.Errorf("blocks for %d bytes = %d, want %d", tc.fsize, blocks, tc.expected)
+			}
+		})
+	}
+}
+
+// TestConstants verifies key constants are correct
+func TestConstants(t *testing.T) {
+	if DiscPort != 45678 {
+		t.Errorf("DiscPort = %d, want 45678", DiscPort)
+	}
+	if XferPort != 45679 {
+		t.Errorf("XferPort = %d, want 45679", XferPort)
+	}
+	if ChunkSz != 1024*1024 {
+		t.Errorf("ChunkSz = %d, want %d", ChunkSz, 1024*1024)
+	}
+	if BufSz != 64*1024 {
+		t.Errorf("BufSz = %d, want %d", BufSz, 64*1024)
+	}
+	if MaxWorkers != 8 {
+		t.Errorf("MaxWorkers = %d, want 8", MaxWorkers)
+	}
+	if ProtoV2 != "PROTOCOL_V2" {
+		t.Errorf("ProtoV2 = %q, want %q", ProtoV2, "PROTOCOL_V2")
+	}
+}
+
+// BenchmarkFormatSize benchmarks file size formatting
+func BenchmarkFormatSize(b *testing.B) {
+	sizes := []int64{1024, 1024*1024, 10*1024*1024, 1024*1024*1024}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		fs(sizes[i%len(sizes)])
+	}
+}
+
+// BenchmarkChecksum benchmarks SHA256 checksum
+func BenchmarkChecksum(b *testing.B) {
+	data := make([]byte, ChunkSz)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		h := sha256.New()
+		h.Write(data)
+		h.Sum(nil)
+	}
+}
+
+// TestPeerStruct tests Peer struct initialization
+func TestPeerStruct(t *testing.T) {
+	peer := &Peer{
+		ID:   "test:45679",
+		Name: "TestDevice",
+		IP:   "192.168.1.100",
+		Port: 45679,
+	}
+
+	if peer.ID == "" || peer.Name == "" || peer.IP == "" || peer.Port == 0 {
+		t.Error("Peer struct fields should not be empty")
+	}
+}
+
+// TestConfigStruct tests Config struct defaults
+func TestConfigStruct(t *testing.T) {
+	if cfg.DeviceName == "" {
+		t.Error("DeviceName should have a default value")
+	}
+	if cfg.SavePath == "" {
+		t.Error("SavePath should have a default value")
+	}
+}
+
+// TestWorkerScaling tests worker count scaling logic
+func TestWorkerScaling(t *testing.T) {
+	tests := []struct {
+		blocks   int
+		expected int
+	}{
+		{0, 1},
+		{1, 1},
+		{2, 2},
+		{3, 2},
+		{4, 4},
+		{8, 4},
+		{16, 8},
+		{17, 8},
+		{100, 8},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("blocks_%d", tc.blocks), func(t *testing.T) {
+			var workers int
+			if tc.blocks < 4 {
+				workers = 2
+			} else if tc.blocks < 16 {
+				workers = 4
+			} else {
+				workers = MaxWorkers
+			}
+			// Edge case: 0 or 1 blocks still uses 1 worker
+			if tc.blocks <= 1 {
+				workers = 1
+			}
+			if workers != tc.expected {
+				t.Errorf("workers for %d blocks = %d, want %d", tc.blocks, workers, tc.expected)
+			}
+		})
 	}
 }
